@@ -2,12 +2,68 @@ import json
 import argparse
 from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer
+import re
+import random
 
 
-def generate_rationale(distill_et_file, output_file, data_key, model_name, temperature, max_tokens):
-    # 加载数据
-    with open(distill_et_file, 'r') as f2:
-        data = json.load(f2)
+def remove_templates(text):
+    """移除模板标记，例如<|...|>"""
+    return re.sub(r'<\|.*?\|>', '', text).strip()
+
+
+def process_data_file(input_filename):
+    output_data = []
+    with open(input_filename, 'r', encoding='utf-8') as infile:
+        for line in infile:
+            line = line.strip()
+            if not line:
+                continue
+            data = json.loads(line)
+
+            # 提取 instruction
+            prompt = data.get('prompt', '')
+            instruction_match = re.search(
+                r'<\|start_header_id\|>user<\|end_header_id\|>\n\n(.*?)<\|eot_id\|>',
+                prompt,
+                re.DOTALL
+            )
+            if instruction_match:
+                instruction = remove_templates(instruction_match.group(1))
+            else:
+                instruction = ''
+
+            # 处理 chosen 和 rejected
+            chosen_text = data.get('chosen', '')
+            rejected_text = data.get('rejected', '')
+
+            # 根据 results 字段确定是否需要交换 chosen 和 rejected
+            if data.get('results', 1) == 0:
+                chosen_text, rejected_text = rejected_text, chosen_text
+
+            # 创建新的数据条目
+            output_entry = {
+                'instruction': instruction,
+                'chosen': chosen_text,
+                'rejected': rejected_text
+            }
+            output_data.append(output_entry)
+    return output_data
+
+
+def generate_rationale(input_file, output_file, model_name, temperature, max_tokens):
+    """
+    生成理由，并构造指定格式的数据。
+
+    Args:
+        input_file (str): 输入数据文件路径。
+        output_file (str): 输出文件路径。
+        model_name (str): vllm 模型名称。
+        temperature (float): 生成随机性温度。
+        max_tokens (int): 最大生成的 token 数量。
+    """
+
+    # 加载处理后的数据
+    processed_data = process_data_file(input_file)
 
     # 初始化 vllm 模型和 tokenizer
     llm = LLM(model=model_name)
@@ -17,37 +73,26 @@ def generate_rationale(distill_et_file, output_file, data_key, model_name, tempe
 
     # 构造 prompts 列表
     conversation_list = []
-    first = 0
-    updated_instructions = []
+    updated_labels = []
     updated_responses = []
 
-    for item2 in data[data_key]:
-        if item2["result"]["orig"]["prediction"] == 1:
+    for item in processed_data:
+        instruction = item["instruction"]
+        response1 = item["chosen"]
+        response2 = item["rejected"]
+
+        # 随机选择 chosen 和 rejected
+        if random.random() < 0.5:
             chosen = "Output (a)"
             rejected = "Output (b)"
-        elif item2["result"]["orig"]["prediction"] == 2:
+            updated_labels.append((chosen, rejected))
+            updated_responses.append((response1, response2))
+        else:
             chosen = "Output (b)"
             rejected = "Output (a)"
-        else:
-            continue
-
-        instruction = item2["instruction"]
-        response1 = item2["response1"]
-        response2 = item2["response2"]
-
-        if first == 0:
-            if chosen == "Output (b)":
-                chosen, rejected = rejected, chosen
-                response1, response2 = response2, response1
-            first = 1
-        elif first == 1:
-            if chosen == "Output (a)":
-                chosen, rejected = rejected, chosen
-                response1, response2 = response2, response1
-            first = 0
-
-        updated_instructions.append(item2["instruction"])
-        updated_responses.append((response1, response2))
+            response1, response2 = response2, response1  # 交换 responses
+            updated_labels.append((chosen, rejected))
+            updated_responses.append((response1, response2))
 
         # 处理原始模型的结果
         conversation = construct_prompt(
@@ -70,7 +115,7 @@ def generate_rationale(distill_et_file, output_file, data_key, model_name, tempe
 
     # 构造新数据
     formatted_data = []
-    for generated_text, instruction, (response1, response2) in zip(generated_texts, updated_instructions, updated_responses):
+    for generated_text, item, (chosen, rejected), (response1, response2) in zip(generated_texts, processed_data, updated_labels, updated_responses):
         # 构造符合格式的数据
         formatted_data.append({
             "system": "You are a helpful assistant in evaluating the quality of the outputs for a given instruction. Your goal is to select the best output for the given instruction.",
@@ -86,7 +131,7 @@ Do NOT say both / neither are good.
 Do NOT output any other words.
 
 # Instruction:
-{instruction}
+{item["instruction"]}
 
 # Output (a):
 {response1}
@@ -121,8 +166,7 @@ def construct_prompt(instruction, response1, response2, chosen, rejected):
 # Output (b):
 {response2}
 
-
-Given that {chosen} is better than {rejected}, please provide the rationale and end with "Therefore, {chosen} is better.":"""
+Given that {chosen} is better than {rejected}, please provide the rationale and end with "Therefore, {chosen} is better." (Do NOT output any other words.):"""
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
@@ -130,14 +174,12 @@ if __name__ == "__main__":
     # 使用 argparse 解析命令行参数
     parser = argparse.ArgumentParser(
         description="Use vllm to generate rationales and format the data.")
-    parser.add_argument("--result_distill_et", type=str, required=True,
-                        help="Path to the Distill ET results JSON file.")
+    parser.add_argument("--input", type=str, required=True,
+                        help="Path to the processed input JSON file.")
     parser.add_argument("--output", type=str, required=True,
                         help="Path to the output file.")
-    parser.add_argument("--data", type=str, default="arena",
-                        help="Key for accessing data (default: arena).")
-    parser.add_argument("--model", type=str, default="gpt-4",
-                        help="Name of the vllm model to use (default: gpt-4).")
+    parser.add_argument("--model", type=str,
+                        help="Name of the vllm model to use.")
     parser.add_argument("--temperature", type=float, default=0.7,
                         help="Temperature for generation randomness.")
     parser.add_argument("--max_tokens", type=int, default=512,
@@ -148,12 +190,10 @@ if __name__ == "__main__":
 
     # 调用主函数
     generate_rationale(
-        distill_et_file=args.result_distill_et,
+        input_file=args.input,
         output_file=args.output,
-        data_key=args.data,
         model_name=args.model,
         temperature=args.temperature,
         max_tokens=args.max_tokens
     )
-
 
